@@ -84,6 +84,11 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
             date = day_of_month(first_row[0]) # fallback to last day
             assert date
 
+        all_currency_list = []
+        all_transactions = []
+        all_conversion = []
+        bank_currency = None
+
         for line in reader:
             if line[0] != 'Country or Region (Currency)':
                 continue
@@ -92,11 +97,10 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
             for line in reader:
                 if line[0] == '':
                     break
-                if line[8] == '':
-                    continue
                 
                 currency_code = re.search(r"\((\w{3})\)", line[0]).group(1)
-                exchange_rate = Decimal(line[8])
+                exchange_rate_str = line[8].strip()
+                exchange_rate = Decimal(exchange_rate_str) if exchange_rate_str else Decimal(0)
                 
                 if currency_code in rates:
                     assert rates[currency_code] == exchange_rate, f"Multiple exchange rates for {currency_code} in {file_name}"
@@ -110,7 +114,7 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
                     witholding = Decimal(line[6]),
                     total = Decimal(line[7]),
                     exchange_rate = exchange_rate,
-                    proceeds = Decimal(line[9]),
+                    proceeds = Decimal(line[9]) if line[9] else Decimal(0),
                     bank_currency = line[10]
                 ))
 
@@ -124,14 +128,12 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
             account = next((s for s in next(reader) if s.strip()), None)
 
             data = []
-            conversion = []
-            bank_currency = None
             data.append([date, f"Assets:Accounts Receivable", amount, INDEX, account, '', 0])
             for currency_data in currency_list:
-                real_exchange_rate = currency_data.proceeds / currency_data.total # this is more accurate
+                real_exchange_rate = currency_data.proceeds / currency_data.total if currency_data.total != 0 else currency_data.exchange_rate
                 data.append([date, f"Assets:Accounts Receivable:{currency_data.currency}", -currency_data.total, INDEX, account, '', real_exchange_rate])
                 if currency_data.currency != currency_data.bank_currency:
-                    conversion.append([date, currency_data.exchange_rate, 'CURRENCY', currency_data.currency, currency_data.bank_currency])
+                    all_conversion.append([date, currency_data.exchange_rate, 'CURRENCY', currency_data.currency, currency_data.bank_currency])
                 if bank_currency == None:
                     bank_currency = currency_data.bank_currency
                 else:
@@ -144,19 +146,23 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
                 adjustments = currency_data.adjustments
                 if taxes + adjustments == 0:
                     continue
-                real_exchange_rate = currency_data.proceeds / currency_data.total # this is more accurate
+                real_exchange_rate = currency_data.proceeds / currency_data.total if currency_data.total != 0 else currency_data.exchange_rate
                 if taxes != 0:
                     data.append([date, "Expenses:Taxes:Other Tax", -taxes * real_exchange_rate, INDEX, f'{currency_data.currency} Taxes and Adjustments', 'Tax', 0])
                 if adjustments != 0:
                     data.append([date, "Expenses:Adjustment", -adjustments * real_exchange_rate, INDEX, f'{currency_data.currency} Taxes and Adjustments', 'Adjustment', 0])
                 data.append([date, f"Assets:Accounts Receivable:{currency_data.currency}", taxes + adjustments, INDEX, f'{currency_data.currency} Taxes and Adjustments', '', real_exchange_rate])
                 INDEX += 1
+            
+            all_transactions.append(Transaction(date, data))
+            all_currency_list.extend(currency_list)
 
+        if all_currency_list:
             payments.append(Payment(
                 bank_currency = bank_currency,
-                transactions = [Transaction(date, data)],
-                conversion = conversion,
-                currencies = currency_list,
+                transactions = all_transactions,
+                conversion = all_conversion,
+                currencies = all_currency_list,
                 date = date
             ))
     return payments
@@ -272,10 +278,17 @@ if __name__ == "__main__":
         with open(config_file, "r") as file:
             INDEX = int(file.read().strip())
 
-    if len(sys.argv) < 3:
-        print("Usage: python3 appstoreconnect2csv.py file1.[txt|csv] file2.[txt|csv] ...")
+    update_only = False
+    saved_index = INDEX
+    if len(sys.argv) > 1 and sys.argv[1] == "--update-only":
+        update_only = True
+        file_names = sys.argv[2:]
     else:
         file_names = sys.argv[1:]
+
+    if len(file_names) < 2:
+        print("Usage: python3 appstoreconnect2csv.py [--update-only] file1.[txt|csv] file2.[txt|csv] ...")
+    else:
         currencies = set()
         target_currency = None
         transactions = []
@@ -283,6 +296,7 @@ if __name__ == "__main__":
         remaining_files = []
         reports = []
         valid_date_ranges = []
+        update_transactions = []
         
         # first parse the txt files
         for file_name in file_names:
@@ -302,6 +316,10 @@ if __name__ == "__main__":
 
         # Match reports with payments to generate commission and sales conversions
         matched_payment_indices = set()
+
+        if update_only:
+            # we don't care about those index anyways
+            INDEX = saved_index
         
         for report in reports:
             candidates = []
@@ -349,7 +367,9 @@ if __name__ == "__main__":
                         # Leg 2: The offset in local currency (Credit)
                         entries.append([date, f"Expenses:Commissions:{currency}", -commission_amount, INDEX, f"Commission {currency}", '', rate])
                         
-                        transactions.append(Transaction(date, entries))
+                        t = Transaction(date, entries)
+                        transactions.append(t)
+                        update_transactions.append(t)
                         INDEX += 1
                 
                 # 2. Generate Sales conversion transactions (Income:Sales:{currency} -> Income:Sales)
@@ -365,7 +385,9 @@ if __name__ == "__main__":
                         converted_sales = sales_amount * rate
                         entries.append([date, "Income:Sales", -converted_sales, INDEX, f"Sales Conversion {currency}", '', 0])
                         
-                        transactions.append(Transaction(date, entries))
+                        t = Transaction(date, entries)
+                        transactions.append(t)
+                        update_transactions.append(t)
                         INDEX += 1
             
             elif len(candidates) > 1:
@@ -381,9 +403,12 @@ if __name__ == "__main__":
             else:
                 assert target_currency == payment.bank_currency, "Multiple bank currencies detected, not supported"
 
-        write_accounts('accounts.csv', target_currency, currencies)
-        write_transactions('transactions.csv', transactions)
-        write_prices('prices.csv', conversions)
+        if update_only:
+            write_transactions('transactions.csv', update_transactions)
+        else:
+            write_accounts('accounts.csv', target_currency, currencies)
+            write_transactions('transactions.csv', transactions)
+            write_prices('prices.csv', conversions)
 
         os.makedirs(os.path.dirname(config_file), exist_ok=True)
         #with open(config_file, "w") as file:
