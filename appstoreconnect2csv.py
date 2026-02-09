@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 from decimal import Decimal
 from collections import namedtuple
-from datetime import datetime
 import calendar
 import re
 import csv
@@ -22,16 +21,12 @@ Report = namedtuple("Report", [
 ])
 
 Payment = namedtuple("Payment", [
-    "bank_currency", "transactions", "conversion", "amount", "estimated_date", "currency_data"
-])
-
-PaymentLogEntry = namedtuple("PaymentLogEntry", [
-    "amount", "currency", "account_name", "units_sold", "date", "transaction_id"
+    "bank_currency", "transactions", "conversion", "currency_data", "date"
 ])
 
 INDEX = 0
 
-def get_estimated_date(input_string):
+def day_of_month(input_string, day = 0):
     # Extract the month and year using regex
     match = re.search(r'\((\w+),\s(\d{4})\)', input_string)
     if match:
@@ -39,59 +34,40 @@ def get_estimated_date(input_string):
         # Convert month name to month number
         month = datetime.strptime(month_name, "%B").month
         year = int(year)
-        # Return first day of the month
-        return datetime(year, month, 1)
+        # Get the last day of the month
+        if not day:
+            day = calendar.monthrange(year, month)[1]
+        # Format the result as MM/DD/YYYY
+        return f"{month:02d}/{day:02d}/{year}"
     else:
         return None
 
-def parse_payment_log(file_name):
-    entries = []
-    with open(file_name, 'r') as f:
-        content = f.read().strip()
-    
-    # Split by double newlines to separate blocks
-    blocks = re.split(r'\n\s*\n', content)
-    
-    for block in blocks:
-        lines = [l.strip() for l in block.split('\n') if l.strip()]
-        if len(lines) < 6:
-            continue
-            
-        # Line 1: Amount + Currency (e.g., "22,070.60 USD")
-        amount_parts = lines[0].split(' ')
-        amount = Decimal(amount_parts[0].replace(',', ''))
-        currency = amount_parts[1] if len(amount_parts) > 1 else ""
-        
-        # Line 2: Account Name
-        account_name = lines[1]
-        
-        # Line 3: Units Sold
-        units_sold = int(lines[2].replace(',', ''))
-        
-        # Line 4: Units Sold Label (ignore)
-        
-        # Line 5: Payment Date
-        date_str = lines[4]
-        try:
-            date = datetime.strptime(date_str, "%B %d, %Y").strftime("%m/%d/%Y")
-        except ValueError:
-             # Fallback or error handling if date format varies
-            date = date_str
+def find_end_date(date_ranges, input_date):
+    """
+    Finds the first end date containing the input date.
 
-        # Line 6: Transaction ID
-        transaction_id = lines[5].replace("Transaction ID: ", "")
-        
-        entries.append(PaymentLogEntry(
-            amount=amount,
-            currency=currency,
-            account_name=account_name,
-            units_sold=units_sold,
-            date=date,
-            transaction_id=transaction_id
-        ))
-    return entries
+    Args:
+        date_ranges (list of tuples): A list of tuples, each containing (start, end) date strings in MM/DD/YYYY format.
+        input_date (str): A date string in MM/DD/YYYY format.
 
-def parse_payment_csv(file_name):
+    Returns:
+        str: The first end date containing the input date, or None if no such range exists.
+    """
+    # Convert input_date to a datetime object
+    input_date_obj = datetime.strptime(input_date, "%m/%d/%Y")
+
+    for start, end in date_ranges:
+        # Convert start and end dates to datetime objects
+        start_date_obj = datetime.strptime(start, "%m/%d/%Y")
+        end_date_obj = datetime.strptime(end, "%m/%d/%Y")
+
+        # Check if input_date is within the range [start, end]
+        if start_date_obj <= input_date_obj <= end_date_obj:
+            return end
+
+    return None
+
+def parse_payment_csv(file_name, valid_date_ranges=None):
     global INDEX
     payments = []
     with open(file_name, newline='') as csvfile:
@@ -101,12 +77,12 @@ def parse_payment_csv(file_name):
             print(f"Ignoring unknown file {file_name}")
             return []
         
-        estimated_date_dt = get_estimated_date(first_row[0])
-        assert estimated_date_dt, "Could not parse date from header"
-        # We store the datetime object for comparison, but convert to string for Transaction if needed?
-        # Transaction expects a string date in MM/DD/YYYY format usually based on previous code.
-        # Let's check Transaction usage. It expects string.
-        date = estimated_date_dt.strftime("%m/%d/%Y")
+        date = None
+        if valid_date_ranges:
+            date = find_end_date(valid_date_ranges, day_of_month(first_row[0], 15))
+        if date is None:
+            date = day_of_month(first_row[0]) # fallback to last day
+            assert date
 
         for line in reader:
             if line[0] != 'Country or Region (Currency)':
@@ -171,9 +147,8 @@ def parse_payment_csv(file_name):
                 bank_currency = bank_currency,
                 transactions = [Transaction(date, data)],
                 conversion = conversion,
-                amount = amount,
-                estimated_date = estimated_date_dt,
-                currency_data = {c.currency: c for c in currency_list}
+                currency_data = {c.currency: c for c in currency_list},
+                date = date
             ))
     return payments
 
@@ -289,31 +264,16 @@ if __name__ == "__main__":
             INDEX = int(file.read().strip())
 
     if len(sys.argv) < 3:
-        print("Usage: python3 appstoreconnect2csv.py [--payments payments.log] file1.[txt|csv] file2.[txt|csv] ...")
+        print("Usage: python3 appstoreconnect2csv.py file1.[txt|csv] file2.[txt|csv] ...")
     else:
-        args = sys.argv[1:]
-        payment_log_file = None
-        if "--payments" in args:
-            try:
-                idx = args.index("--payments")
-                if idx + 1 < len(args):
-                    payment_log_file = args[idx+1]
-                    # Remove --payments and its argument from args
-                    args.pop(idx)
-                    args.pop(idx)
-                else:
-                    print("Error: --payments requires a file argument")
-                    sys.exit(1)
-            except ValueError:
-                pass
-
-        file_names = args
+        file_names = sys.argv[1:]
         currencies = set()
         target_currency = None
         transactions = []
         conversions = []
         remaining_files = []
         reports = []
+        valid_date_ranges = []
         
         # first parse the txt files
         for file_name in file_names:
@@ -322,19 +282,16 @@ if __name__ == "__main__":
                 reports.append(report)
                 currencies |= report.currencies
                 transactions += report.transactions
+                valid_date_ranges.append((report.start_date, report.end_date))
             else:
                 remaining_files.append(file_name)
         
-        parsed_payments = []
-        if payment_log_file:
-            parsed_payments = parse_payment_log(payment_log_file)
-
         # next parse the csv files
         all_csv_payments = []
         for file_name in remaining_files:
-            all_csv_payments.extend(parse_payment_csv(file_name))
+            all_csv_payments.extend(parse_payment_csv(file_name, valid_date_ranges))
 
-        # Match reports with payments to generate commission conversions
+        # Match reports with payments to generate commission and sales conversions
         for report in reports:
             matched_payment = None
             # Try to match report to a payment based on total earned for a currency
@@ -342,19 +299,16 @@ if __name__ == "__main__":
                 match_count = 0
                 for currency, earned_amount in report.earned.items():
                     if currency in payment.currency_data:
-                        # Allow small tolerance for floating point differences? 
-                        # Decimal should be exact if parsed correctly.
                         if payment.currency_data[currency].earned == earned_amount:
                             match_count += 1
                 
                 # If we have at least one currency match, assume it's the right payment report
-                # (Ideally multiple currencies match)
                 if match_count > 0:
                     matched_payment = payment
                     break
             
             if matched_payment:
-                date = matched_payment.transactions[0].date # Use the payment date
+                date = matched_payment.date
                 
                 # 1. Generate commission conversion transactions
                 for currency, commission_amount in report.commissions.items():
@@ -374,16 +328,11 @@ if __name__ == "__main__":
                 
                 # 2. Generate Sales conversion transactions (Income:Sales:{currency} -> Income:Sales)
                 for currency, sales_amount in report.sales.items():
-                    # sales_amount in report.sales is the net positive sales amount (abs(price) * qty)
-                    # In ledger, Sales are Credit (Negative).
-                    # We want to Debit Income:Sales:{currency} (to reduce it) and Credit Income:Sales (USD).
-                    
                     if currency in matched_payment.currency_data:
                         rate = matched_payment.currency_data[currency].exchange_rate
                         
                         entries = []
                         # Leg 1: Debit Income:Sales:{currency} (reduce local income)
-                        # The original entry was Credit (negative). To reduce/close it, we Debit (positive).
                         entries.append([date, f"Income:Sales:{currency}", sales_amount, INDEX, f"Sales Conversion {currency}", '', rate])
                         
                         # Leg 2: Credit Income:Sales (increase base income)
@@ -393,56 +342,13 @@ if __name__ == "__main__":
                         transactions.append(Transaction(date, entries))
                         INDEX += 1
 
-        if parsed_payments:
-            for payment in all_csv_payments:
-                matched_entry = None
-                for i, entry in enumerate(parsed_payments):
-                    try:
-                        entry_date = datetime.strptime(entry.date, "%m/%d/%Y")
-                    except ValueError:
-                        continue 
-                    
-                    # Match if amount matches and payment date is strictly after the estimated date (start of earnings month)
-                    if entry.amount == payment.amount and entry_date > payment.estimated_date:
-                        matched_entry = entry
-                        parsed_payments.pop(i)
-                        break
-                
-                if matched_entry:
-                    new_date_str = matched_entry.date
-                    
-                    # Rebuild transactions with new date
-                    for t in payment.transactions:
-                        new_entries = []
-                        for row in t.entries:
-                            new_row = list(row)
-                            new_row[0] = new_date_str
-                            new_entries.append(new_row)
-                        transactions.append(Transaction(new_date_str, new_entries))
-                    
-                    # Rebuild conversions with new date
-                    for c in payment.conversion:
-                        new_c = list(c)
-                        new_c[0] = new_date_str
-                        conversions.append(new_c)
-
-                    if target_currency == None:
-                        target_currency = payment.bank_currency
-                    else:
-                        assert target_currency == payment.bank_currency, "Multiple bank currencies detected, not supported"
-
-                else:
-                    print(f"Error: Could not find matching payment for amount {payment.amount} after {payment.estimated_date}")
-                    sys.exit(1)
-        else:
-            # Fallback if no payment log provided: use estimated dates
-            for payment in all_csv_payments:
-                transactions += payment.transactions
-                conversions += payment.conversion
-                if target_currency == None:
-                    target_currency = payment.bank_currency
-                else:
-                    assert target_currency == payment.bank_currency, "Multiple bank currencies detected, not supported"
+        for payment in all_csv_payments:
+            transactions += payment.transactions
+            conversions += payment.conversion
+            if target_currency == None:
+                target_currency = payment.bank_currency
+            else:
+                assert target_currency == payment.bank_currency, "Multiple bank currencies detected, not supported"
 
         write_accounts('accounts.csv', target_currency, currencies)
         write_transactions('transactions.csv', transactions)
