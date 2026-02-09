@@ -356,39 +356,37 @@ if __name__ == "__main__":
                 
                 # 1. Generate commission conversion transactions
                 for currency, commission_amount in report.commissions.items():
-                    if commission_amount > 0 and currency in payment_rates:
-                        rate = payment_rates[currency]
-                        
-                        entries = []
-                        # Leg 1: The expense in target currency (Debit)
-                        converted_amount = commission_amount * rate
-                        entries.append([date, "Expenses:Commissions", converted_amount, INDEX, f"Commission {currency}", '', 0])
-                        
-                        # Leg 2: The offset in local currency (Credit)
-                        entries.append([date, f"Expenses:Commissions:{currency}", -commission_amount, INDEX, f"Commission {currency}", '', rate])
-                        
-                        t = Transaction(date, entries)
-                        transactions.append(t)
-                        update_transactions.append(t)
-                        INDEX += 1
+                    rate = payment_rates[currency]
+                    
+                    entries = []
+                    # Leg 1: The expense in target currency (Debit)
+                    converted_amount = commission_amount * rate
+                    entries.append([date, "Expenses:Commissions", converted_amount, INDEX, f"Commission {currency}", '', 0])
+                    
+                    # Leg 2: The offset in local currency (Credit)
+                    entries.append([date, f"Expenses:Commissions:{currency}", -commission_amount, INDEX, f"Commission {currency}", '', rate])
+                    
+                    t = Transaction(date, entries)
+                    transactions.append(t)
+                    update_transactions.append(t)
+                    INDEX += 1
                 
                 # 2. Generate Sales conversion transactions (Income:Sales:{currency} -> Income:Sales)
                 for currency, sales_amount in report.sales.items():
-                    if currency in payment_rates:
-                        rate = payment_rates[currency]
-                        
-                        entries = []
-                        # Leg 1: Debit Income:Sales:{currency} (reduce local income)
-                        entries.append([date, f"Income:Sales:{currency}", sales_amount, INDEX, f"Sales Conversion {currency}", '', rate])
-                        
-                        # Leg 2: Credit Income:Sales (increase base income)
-                        converted_sales = sales_amount * rate
-                        entries.append([date, "Income:Sales", -converted_sales, INDEX, f"Sales Conversion {currency}", '', 0])
-                        
-                        t = Transaction(date, entries)
-                        transactions.append(t)
-                        update_transactions.append(t)
-                        INDEX += 1
+                    rate = payment_rates[currency]
+                    
+                    entries = []
+                    # Leg 1: Credit Income:Sales (increase base income)
+                    converted_sales = sales_amount * rate
+                    entries.append([date, "Income:Sales", -converted_sales, INDEX, f"Sales Conversion {currency}", '', 0])
+
+                    # Leg 2: Debit Income:Sales:{currency} (reduce local income)
+                    entries.append([date, f"Income:Sales:{currency}", sales_amount, INDEX, f"Sales Conversion {currency}", '', rate])
+                    
+                    t = Transaction(date, entries)
+                    transactions.append(t)
+                    update_transactions.append(t)
+                    INDEX += 1
             
             elif len(candidates) > 1:
                 print(f"Error: Multiple payments matched for report ending {report.end_date}")
