@@ -21,7 +21,7 @@ Report = namedtuple("Report", [
 ])
 
 Payment = namedtuple("Payment", [
-    "bank_currency", "transactions", "conversion", "currency_data", "date"
+    "bank_currency", "transactions", "conversion", "currencies", "date"
 ])
 
 INDEX = 0
@@ -88,19 +88,28 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
             if line[0] != 'Country or Region (Currency)':
                 continue
             currency_list = []
+            rates = {}
             for line in reader:
                 if line[0] == '':
                     break
                 if line[8] == '':
                     continue
+                
+                currency_code = re.search(r"\((\w{3})\)", line[0]).group(1)
+                exchange_rate = Decimal(line[8])
+                
+                if currency_code in rates:
+                    assert rates[currency_code] == exchange_rate, f"Multiple exchange rates for {currency_code} in {file_name}"
+                rates[currency_code] = exchange_rate
+
                 currency_list.append(CurrencyData(
-                    currency = re.search(r"\((\w{3})\)", line[0]).group(1),
+                    currency = currency_code,
                     earned = Decimal(line[2]),
                     input_tax = Decimal(line[4]),
                     adjustments = Decimal(line[5]),
                     witholding = Decimal(line[6]),
                     total = Decimal(line[7]),
-                    exchange_rate = Decimal(line[8]),
+                    exchange_rate = exchange_rate,
                     proceeds = Decimal(line[9]),
                     bank_currency = line[10]
                 ))
@@ -147,7 +156,7 @@ def parse_payment_csv(file_name, valid_date_ranges=None):
                 bank_currency = bank_currency,
                 transactions = [Transaction(date, data)],
                 conversion = conversion,
-                currency_data = {c.currency: c for c in currency_list},
+                currencies = currency_list,
                 date = date
             ))
     return payments
@@ -292,28 +301,45 @@ if __name__ == "__main__":
             all_csv_payments.extend(parse_payment_csv(file_name, valid_date_ranges))
 
         # Match reports with payments to generate commission and sales conversions
+        matched_payment_indices = set()
+        
         for report in reports:
-            matched_payment = None
-            # Try to match report to a payment based on total earned for a currency
-            for payment in all_csv_payments:
-                match_count = 0
-                for currency, earned_amount in report.earned.items():
-                    if currency in payment.currency_data:
-                        if payment.currency_data[currency].earned == earned_amount:
-                            match_count += 1
+            candidates = []
+            for idx, payment in enumerate(all_csv_payments):
+                if idx in matched_payment_indices:
+                    continue
                 
-                # If we have at least one currency match, assume it's the right payment report
-                if match_count > 0:
-                    matched_payment = payment
-                    break
+                # Check criteria
+                all_currencies_match = True
+                if not report.earned: 
+                     all_currencies_match = False
+
+                # Calculate payment sums for each currency
+                payment_sums = {}
+                for c in payment.currencies:
+                    payment_sums[c.currency] = payment_sums.get(c.currency, Decimal(0)) + c.earned
+
+                for currency, earned_amount in report.earned.items():
+                    # Check if currency exists in payment and amount matches
+                    if currency not in payment_sums or \
+                       payment_sums[currency] != earned_amount:
+                        all_currencies_match = False
+                        break
+                
+                if all_currencies_match:
+                    candidates.append((idx, payment))
             
-            if matched_payment:
+            if len(candidates) == 1:
+                idx, matched_payment = candidates[0]
+                matched_payment_indices.add(idx)
+                
                 date = matched_payment.date
+                payment_rates = {c.currency: c.exchange_rate for c in matched_payment.currencies}
                 
                 # 1. Generate commission conversion transactions
                 for currency, commission_amount in report.commissions.items():
-                    if commission_amount > 0 and currency in matched_payment.currency_data:
-                        rate = matched_payment.currency_data[currency].exchange_rate
+                    if commission_amount > 0 and currency in payment_rates:
+                        rate = payment_rates[currency]
                         
                         entries = []
                         # Leg 1: The expense in target currency (Debit)
@@ -328,8 +354,8 @@ if __name__ == "__main__":
                 
                 # 2. Generate Sales conversion transactions (Income:Sales:{currency} -> Income:Sales)
                 for currency, sales_amount in report.sales.items():
-                    if currency in matched_payment.currency_data:
-                        rate = matched_payment.currency_data[currency].exchange_rate
+                    if currency in payment_rates:
+                        rate = payment_rates[currency]
                         
                         entries = []
                         # Leg 1: Debit Income:Sales:{currency} (reduce local income)
@@ -341,6 +367,11 @@ if __name__ == "__main__":
                         
                         transactions.append(Transaction(date, entries))
                         INDEX += 1
+            
+            elif len(candidates) > 1:
+                print(f"Error: Multiple payments matched for report ending {report.end_date}")
+            else:
+                print(f"Warning: No payment found for report ending {report.end_date}")
 
         for payment in all_csv_payments:
             transactions += payment.transactions
