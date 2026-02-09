@@ -18,7 +18,7 @@ Transaction = namedtuple("Transaction", [
 ])
 
 Report = namedtuple("Report", [
-    "currencies", "transactions", "start_date", "end_date", "commissions", "earned"
+    "currencies", "transactions", "start_date", "end_date", "commissions", "earned", "sales"
 ])
 
 Payment = namedtuple("Payment", [
@@ -144,7 +144,7 @@ def parse_payment_csv(file_name):
             data.append([date, f"Assets:Accounts Receivable", amount, INDEX, account, '', 0])
             for currency_data in currency_list:
                 real_exchange_rate = currency_data.proceeds / currency_data.total # this is more accurate
-                data.append([date, f"Assets:App Store Payments:{currency_data.currency}", -currency_data.total, INDEX, account, '', real_exchange_rate])
+                data.append([date, f"Assets:Accounts Receivable:{currency_data.currency}", -currency_data.total, INDEX, account, '', real_exchange_rate])
                 if currency_data.currency != currency_data.bank_currency:
                     conversion.append([date, currency_data.exchange_rate, 'CURRENCY', currency_data.currency, currency_data.bank_currency])
                 if bank_currency == None:
@@ -164,7 +164,7 @@ def parse_payment_csv(file_name):
                     data.append([date, "Expenses:Taxes:Other Tax", -taxes * real_exchange_rate, INDEX, f'{currency_data.currency} Taxes and Adjustments', 'Tax', 0])
                 if adjustments != 0:
                     data.append([date, "Expenses:Adjustment", -adjustments * real_exchange_rate, INDEX, f'{currency_data.currency} Taxes and Adjustments', 'Adjustment', 0])
-                data.append([date, f"Assets:App Store Payments:{currency_data.currency}", taxes + adjustments, INDEX, f'{currency_data.currency} Taxes and Adjustments', '', real_exchange_rate])
+                data.append([date, f"Assets:Accounts Receivable:{currency_data.currency}", taxes + adjustments, INDEX, f'{currency_data.currency} Taxes and Adjustments', '', real_exchange_rate])
                 INDEX += 1
 
             payments.append(Payment(
@@ -184,6 +184,7 @@ def parse_app_store_connect_report(file_name):
     currencies = set()
     commissions = {}
     earned = {}
+    sales = {}
 
     with open(file_name, 'r') as file:
         lines = file.readlines()
@@ -224,30 +225,14 @@ def parse_app_store_connect_report(file_name):
         partner_total = abs(partner_share) * quantity
         commission = (abs(customer_price) - abs(partner_share)) * quantity
 
-        # Accumulate commissions and earned (partner_share)
+        # Accumulate totals
         commissions[customer_currency] = commissions.get(customer_currency, Decimal(0)) + commission
-        # Note: partner_share in text file is per unit.
-        # Check if quantity can be negative (Returns).
-        # If quantity is negative, partner_total is positive (abs used above).
-        # We need the actual signed amount for matching "Earned"?
-        # CSV "Earned" is usually Sum of (Partner Share * Quantity).
-        # If Return: Partner Share is positive, Quantity is -1. Result is negative.
-        # But above code uses abs(partner_share) * quantity.
-        # Wait, if quantity is negative:
-        # customer_total = abs(price) * -1 = negative.
-        # partner_total = abs(share) * -1 = negative.
-        # commission = (abs(price) - abs(share)) * -1 = negative.
-        # The existing code logic:
-        # customer_total = abs(customer_price) * quantity  <-- this preserves sign of quantity
-        # partner_total = abs(partner_share) * quantity    <-- this preserves sign of quantity
-        # commission = ... * quantity                      <-- this preserves sign of quantity
-        
-        # So summing partner_total is correct for matching CSV "Earned" (which is net).
         earned[customer_currency] = earned.get(customer_currency, Decimal(0)) + partner_total
+        sales[customer_currency] = sales.get(customer_currency, Decimal(0)) + customer_total
 
         data = []
         data.append([settlement_date, f"Income:Sales:{customer_currency}", -customer_total, INDEX, title, '', 0])
-        data.append([settlement_date, f"Assets:App Store Payments:{customer_currency}", partner_total, INDEX, title, '', 0])
+        data.append([settlement_date, f"Assets:Accounts Receivable:{customer_currency}", partner_total, INDEX, title, '', 0])
         data.append([settlement_date, f"Expenses:Commissions:{customer_currency}", commission, INDEX, title, 'Commission', 0])
         transactions.append(Transaction(settlement_date, data))
         INDEX += 1
@@ -258,7 +243,8 @@ def parse_app_store_connect_report(file_name):
         start_date = start_date,
         end_date = end_date,
         commissions = commissions,
-        earned = earned
+        earned = earned,
+        sales = sales
     )
 
 def write_accounts(output_csv, target_currency, currencies):
@@ -267,13 +253,12 @@ def write_accounts(output_csv, target_currency, currencies):
         csv_writer = csv.writer(csvfile)
         csv_writer.writerow(['Type','Full Account Name','Account Name','Account Code','Description','Account Color','Notes','Symbol','Namespace','Hidden','Tax Info','Placeholder'])
         csv_writer.writerow(['RECEIVABLE','Assets:Accounts Receivable','Accounts Receivable','','Accounts Receivable','','',target_currency,'CURRENCY','F','F','F'])
-        csv_writer.writerow(['ASSET',f'Assets:App Store Payments','App Store Payments','','App Store Payments','','',target_currency,'CURRENCY','F','F','T'])
         csv_writer.writerow(['EXPENSE','Expenses:Adjustment','Adjustment','','Adjustment','','',target_currency,'CURRENCY','F','F','F'])
         csv_writer.writerow(['EXPENSE','Expenses:Taxes:Other Tax','Other Tax','','Other Tax','','',target_currency,'CURRENCY','F','F','F'])
         csv_writer.writerow(['EXPENSE','Expenses:Commissions','Commissions','','Commissions','','',target_currency,'CURRENCY','F','F','F'])
-        csv_writer.writerow(['INCOME','Income:Sales','Sales','','','','',target_currency,'CURRENCY','F','F','T'])
+        csv_writer.writerow(['INCOME','Income:Sales','Sales','','','','',target_currency,'CURRENCY','F','F','F'])
         for currency in currencies:
-            csv_writer.writerow(['ASSET',f'Assets:App Store Payments:{currency}',currency,'','','','',currency,'CURRENCY','F','F','F'])
+            csv_writer.writerow(['RECEIVABLE',f'Assets:Accounts Receivable:{currency}',currency,'','','','',currency,'CURRENCY','F','F','F'])
             csv_writer.writerow(['EXPENSE',f'Expenses:Commissions:{currency}',currency,'','','','',currency,'CURRENCY','F','F','F'])
             csv_writer.writerow(['INCOME',f'Income:Sales:{currency}',currency,'','','','',currency,'CURRENCY','F','F','F'])
         print(f"Accounts successfully written to {output_csv}")
@@ -369,28 +354,12 @@ if __name__ == "__main__":
                     break
             
             if matched_payment:
-                # Generate commission conversion transactions
                 date = matched_payment.transactions[0].date # Use the payment date
+                
+                # 1. Generate commission conversion transactions
                 for currency, commission_amount in report.commissions.items():
                     if commission_amount > 0 and currency in matched_payment.currency_data:
-                        # Use the "real" exchange rate calculated from proceeds/total if possible,
-                        # or the one from CSV. The CSV one is 'exchange_rate'.
-                        # The script calculates real_exchange_rate = proceeds / total.
-                        # 'total' in CSV is 'earned' - tax + adjustments.
-                        # We want the rate that converts the local currency to bank currency.
-                        # In parse_payment_csv: real_exchange_rate = currency_data.proceeds / currency_data.total
-                        # But commission is Pre-Tax usually.
-                        # The exchange rate in CSV 'Exchange Rate' column is likely the one to use for general conversion.
-                        # parse_payment_csv stores 'exchange_rate' in CurrencyData.
-                        
                         rate = matched_payment.currency_data[currency].exchange_rate
-                        
-                        # Create transaction
-                        # Debit Expenses:Commissions (Target/USD)
-                        # Credit Expenses:Commissions:{currency} (Source)
-                        
-                        # Note: 'transactions' list expects Transaction objects with 'entries'.
-                        # Entry format: [date, account, amount, index, description, memo, price]
                         
                         entries = []
                         # Leg 1: The expense in target currency (Debit)
@@ -398,8 +367,28 @@ if __name__ == "__main__":
                         entries.append([date, "Expenses:Commissions", converted_amount, INDEX, f"Commission {currency}", '', 0])
                         
                         # Leg 2: The offset in local currency (Credit)
-                        # We provide the price (exchange rate) here so the ledger knows the conversion
                         entries.append([date, f"Expenses:Commissions:{currency}", -commission_amount, INDEX, f"Commission {currency}", '', rate])
+                        
+                        transactions.append(Transaction(date, entries))
+                        INDEX += 1
+                
+                # 2. Generate Sales conversion transactions (Income:Sales:{currency} -> Income:Sales)
+                for currency, sales_amount in report.sales.items():
+                    # sales_amount in report.sales is the net positive sales amount (abs(price) * qty)
+                    # In ledger, Sales are Credit (Negative).
+                    # We want to Debit Income:Sales:{currency} (to reduce it) and Credit Income:Sales (USD).
+                    
+                    if currency in matched_payment.currency_data:
+                        rate = matched_payment.currency_data[currency].exchange_rate
+                        
+                        entries = []
+                        # Leg 1: Debit Income:Sales:{currency} (reduce local income)
+                        # The original entry was Credit (negative). To reduce/close it, we Debit (positive).
+                        entries.append([date, f"Income:Sales:{currency}", sales_amount, INDEX, f"Sales Conversion {currency}", '', rate])
+                        
+                        # Leg 2: Credit Income:Sales (increase base income)
+                        converted_sales = sales_amount * rate
+                        entries.append([date, "Income:Sales", -converted_sales, INDEX, f"Sales Conversion {currency}", '', 0])
                         
                         transactions.append(Transaction(date, entries))
                         INDEX += 1
