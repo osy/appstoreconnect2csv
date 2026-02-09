@@ -18,11 +18,11 @@ Transaction = namedtuple("Transaction", [
 ])
 
 Report = namedtuple("Report", [
-    "currencies", "transactions", "start_date", "end_date"
+    "currencies", "transactions", "start_date", "end_date", "commissions", "earned"
 ])
 
 Payment = namedtuple("Payment", [
-    "bank_currency", "transactions", "conversion", "amount", "estimated_date"
+    "bank_currency", "transactions", "conversion", "amount", "estimated_date", "currency_data"
 ])
 
 PaymentLogEntry = namedtuple("PaymentLogEntry", [
@@ -172,7 +172,8 @@ def parse_payment_csv(file_name):
                 transactions = [Transaction(date, data)],
                 conversion = conversion,
                 amount = amount,
-                estimated_date = estimated_date_dt
+                estimated_date = estimated_date_dt,
+                currency_data = {c.currency: c for c in currency_list}
             ))
     return payments
 
@@ -181,6 +182,8 @@ def parse_app_store_connect_report(file_name):
     all_data = []
     transactions = []
     currencies = set()
+    commissions = {}
+    earned = {}
 
     with open(file_name, 'r') as file:
         lines = file.readlines()
@@ -221,6 +224,27 @@ def parse_app_store_connect_report(file_name):
         partner_total = abs(partner_share) * quantity
         commission = (abs(customer_price) - abs(partner_share)) * quantity
 
+        # Accumulate commissions and earned (partner_share)
+        commissions[customer_currency] = commissions.get(customer_currency, Decimal(0)) + commission
+        # Note: partner_share in text file is per unit.
+        # Check if quantity can be negative (Returns).
+        # If quantity is negative, partner_total is positive (abs used above).
+        # We need the actual signed amount for matching "Earned"?
+        # CSV "Earned" is usually Sum of (Partner Share * Quantity).
+        # If Return: Partner Share is positive, Quantity is -1. Result is negative.
+        # But above code uses abs(partner_share) * quantity.
+        # Wait, if quantity is negative:
+        # customer_total = abs(price) * -1 = negative.
+        # partner_total = abs(share) * -1 = negative.
+        # commission = (abs(price) - abs(share)) * -1 = negative.
+        # The existing code logic:
+        # customer_total = abs(customer_price) * quantity  <-- this preserves sign of quantity
+        # partner_total = abs(partner_share) * quantity    <-- this preserves sign of quantity
+        # commission = ... * quantity                      <-- this preserves sign of quantity
+        
+        # So summing partner_total is correct for matching CSV "Earned" (which is net).
+        earned[customer_currency] = earned.get(customer_currency, Decimal(0)) + partner_total
+
         data = []
         data.append([settlement_date, f"Income:Sales:{customer_currency}", -customer_total, INDEX, title, '', 0])
         data.append([settlement_date, f"Assets:App Store Payments:{customer_currency}", partner_total, INDEX, title, '', 0])
@@ -232,7 +256,9 @@ def parse_app_store_connect_report(file_name):
         currencies = currencies,
         transactions = transactions,
         start_date = start_date,
-        end_date = end_date
+        end_date = end_date,
+        commissions = commissions,
+        earned = earned
     )
 
 def write_accounts(output_csv, target_currency, currencies):
@@ -302,11 +328,13 @@ if __name__ == "__main__":
         transactions = []
         conversions = []
         remaining_files = []
+        reports = []
         
         # first parse the txt files
         for file_name in file_names:
             if not file_name.endswith('.csv'):
                 report = parse_app_store_connect_report(file_name)
+                reports.append(report)
                 currencies |= report.currencies
                 transactions += report.transactions
             else:
@@ -320,6 +348,61 @@ if __name__ == "__main__":
         all_csv_payments = []
         for file_name in remaining_files:
             all_csv_payments.extend(parse_payment_csv(file_name))
+
+        # Match reports with payments to generate commission conversions
+        for report in reports:
+            matched_payment = None
+            # Try to match report to a payment based on total earned for a currency
+            for payment in all_csv_payments:
+                match_count = 0
+                for currency, earned_amount in report.earned.items():
+                    if currency in payment.currency_data:
+                        # Allow small tolerance for floating point differences? 
+                        # Decimal should be exact if parsed correctly.
+                        if payment.currency_data[currency].earned == earned_amount:
+                            match_count += 1
+                
+                # If we have at least one currency match, assume it's the right payment report
+                # (Ideally multiple currencies match)
+                if match_count > 0:
+                    matched_payment = payment
+                    break
+            
+            if matched_payment:
+                # Generate commission conversion transactions
+                date = matched_payment.transactions[0].date # Use the payment date
+                for currency, commission_amount in report.commissions.items():
+                    if commission_amount > 0 and currency in matched_payment.currency_data:
+                        # Use the "real" exchange rate calculated from proceeds/total if possible,
+                        # or the one from CSV. The CSV one is 'exchange_rate'.
+                        # The script calculates real_exchange_rate = proceeds / total.
+                        # 'total' in CSV is 'earned' - tax + adjustments.
+                        # We want the rate that converts the local currency to bank currency.
+                        # In parse_payment_csv: real_exchange_rate = currency_data.proceeds / currency_data.total
+                        # But commission is Pre-Tax usually.
+                        # The exchange rate in CSV 'Exchange Rate' column is likely the one to use for general conversion.
+                        # parse_payment_csv stores 'exchange_rate' in CurrencyData.
+                        
+                        rate = matched_payment.currency_data[currency].exchange_rate
+                        
+                        # Create transaction
+                        # Debit Expenses:Commissions (Target/USD)
+                        # Credit Expenses:Commissions:{currency} (Source)
+                        
+                        # Note: 'transactions' list expects Transaction objects with 'entries'.
+                        # Entry format: [date, account, amount, index, description, memo, price]
+                        
+                        entries = []
+                        # Leg 1: The expense in target currency (Debit)
+                        converted_amount = commission_amount * rate
+                        entries.append([date, "Expenses:Commissions", converted_amount, INDEX, f"Commission {currency}", '', 0])
+                        
+                        # Leg 2: The offset in local currency (Credit)
+                        # We provide the price (exchange rate) here so the ledger knows the conversion
+                        entries.append([date, f"Expenses:Commissions:{currency}", -commission_amount, INDEX, f"Commission {currency}", '', rate])
+                        
+                        transactions.append(Transaction(date, entries))
+                        INDEX += 1
 
         if parsed_payments:
             for payment in all_csv_payments:
