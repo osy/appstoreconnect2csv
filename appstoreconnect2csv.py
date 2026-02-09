@@ -411,5 +411,5 @@ if __name__ == "__main__":
             write_prices('prices.csv', conversions)
 
         os.makedirs(os.path.dirname(config_file), exist_ok=True)
-        #with open(config_file, "w") as file:
-        #    file.write(str(INDEX))
+        with open(config_file, "w") as file:
+            file.write(str(INDEX))
