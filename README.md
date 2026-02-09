@@ -7,7 +7,7 @@ This script parses transactions (txt) and bank deposit information (csv) from Ap
 * Each transaction is split into commission (expense) and sale (income)
 * Different currencies are placed into separate currency accounts
 * Bank deposits are credited from each currency account and debited into "accounts receivable" in a split transaction with the correct currency conversion
-* Date of the deposit is matched to the closing date from the transaction txt file and falls back to the last day of the month if unable to be matched
+* Date of the deposit is taken from the provided payment log file
 * Exchange rates from each deposit statement is converted to a Gnucash rates list for more accurate day-to-day reports
 * Taxes and adjustments are recorded in expenses
 
@@ -23,13 +23,15 @@ One major challenge in handing taxes for App Store earnings is that Apple report
 4. Select "All Countries or Regions (Detailed)" and click "Create Report"
 5. Download the .zip file and extract it to get the .txt report
 6. Back on the website, click the Download button above "Proceeds" to download the payment .csv
-7. Repeat steps 2-6 for any other month
+7. Copy/paste the payment information into payment.log
+8. Repeat steps 2-7 for any other month
+9. Prepare a `payments.log` file containing the payment details (amount, account, units, date, transaction ID) for verification and dating.
 
 ## Generating CSV
 
 Put all the .txt and .csv into a single directory and `cd` into that directory in Terminal. Then run:
 
-`$ ./appstoreconnect2csv.py *.txt *.csv`
+`$ ./appstoreconnect2csv.py --payments payments.log *.txt *.csv`
 
 And this will generate three files:
 
